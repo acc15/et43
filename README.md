@@ -288,4 +288,4 @@ tests/
 
 ## License
 
-[MIT](https://github.com/acc15/et43/blob/main/LICENSE)
+[MIT](https://github.com/acc15/et43/blob/master/LICENSE)
