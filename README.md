@@ -165,7 +165,7 @@ primary, secondary = lcr.fetch()
 
 `fetch()` neither configures the instrument nor waits: it is a single query.
 Measurement loops and frequency sweeps are left to your code; see
-[`scripts/`](https://github.com/acc15/et43/tree/main/scripts) in the repository for examples.
+[`scripts/`](https://github.com/acc15/et43/tree/master/scripts) in the repository for examples.
 
 ## Remote and local mode
 

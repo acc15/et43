@@ -28,7 +28,6 @@ dependencies = ["pyserial>=3.5"]
 Homepage = "https://github.com/acc15/et43"
 Repository = "https://github.com/acc15/et43"
 Issues = "https://github.com/acc15/et43/issues"
-Changelog = "https://github.com/acc15/et43/blob/main/CHANGELOG.md"
 
 [tool.ruff]
 src = ["src"]
