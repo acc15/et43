@@ -1,6 +1,6 @@
 [project]
 name = "et43"
-version = "0.1.0"
+version = "0.1.1"
 description = "Human-friendly Python client for EastTester ET43x LCR meters (ET430-ET433)"
 readme = "README.md"
 authors = [
