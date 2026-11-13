@@ -62,6 +62,11 @@ Without a port name the client looks for the instrument itself:
 lcr = ET43.open()  # auto-discovery, tries 115200 and 9600 baud
 ```
 
+Discovery probes only USB serial adapters (the ET433 uses a CH340) and never
+touches other ports such as built-in `/dev/ttyS*`. If no adapter is found it
+raises `ConnectionError` right away; pass the port name explicitly for other
+setups.
+
 `ET43.open()` is a convenience factory: it creates and configures a
 `serial.Serial` and hands it to the client. If you already have a port object,
 pass it directly:

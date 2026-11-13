@@ -126,21 +126,22 @@ class ET43:
         """Find a connected ET43x and return ``(port, baudrate)``.
 
         Only USB serial adapters are probed by default (the ET433 uses a
-        CH340).  Pass explicit ``ports`` to search something else.
+        CH340); other ports such as built-in ``/dev/ttyS*`` are never touched.
+        Pass explicit ``ports`` to search something else.
         """
         if ports is None:
-            candidates = list(list_ports.comports())
-            selected: list[str] = [
+            ports = [
                 item.device
-                for item in candidates
+                for item in list_ports.comports()
                 if item.vid == 0x1A86
                 or "CH340" in (item.description or "").upper()
                 or "USB SERIAL" in (item.description or "").upper()
             ]
-            ports = selected if selected else [item.device for item in candidates]
+            if not ports:
+                raise ConnectionError("ET43x not found: no USB serial adapter detected")
 
         if not ports:
-            raise ConnectionError("no serial ports found")
+            raise ConnectionError("ET43x not found: no ports to probe")
 
         for device in ports:
             for baudrate in baudrates:
@@ -164,9 +165,7 @@ class ET43:
                 if b"ET43" in answer.upper():
                     return device, baudrate
 
-        raise ConnectionError(
-            "no ET43x device answered; checked " + ", ".join(f"{port} @ {baud}" for port in ports for baud in baudrates)
-        )
+        raise ConnectionError(f"ET43x not found: no answer on {', '.join(ports)}")
 
     def close(self) -> None:
         """Close the serial port."""

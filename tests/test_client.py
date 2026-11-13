@@ -1,7 +1,9 @@
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
 import serial
+from serial.tools import list_ports
 
 from et43.client import CALIBRATION_TIMEOUT, ET43, Reading
 from et43.enums import (
@@ -164,6 +166,20 @@ def test_display_page_rejects_unknown(value: str) -> None:
 def test_discover_without_ports_raises_connection_error() -> None:
     with pytest.raises(ConnectionError):
         ET43.discover(ports=[])
+
+
+def test_discover_skips_non_usb_ports(monkeypatch: pytest.MonkeyPatch) -> None:
+    builtin = [SimpleNamespace(device=f"/dev/ttyS{i}", vid=None, description="n/a") for i in range(32)]
+    monkeypatch.setattr(list_ports, "comports", lambda: builtin)
+
+    def fail_open(**_: object) -> None:
+        pytest.fail("non-USB ports must not be opened")
+
+    monkeypatch.setattr(serial, "Serial", fail_open)
+
+    with pytest.raises(ConnectionError, match="no USB serial adapter") as info:
+        ET43.discover()
+    assert "ttyS" not in str(info.value)
 
 
 def _client(answer: str, responses: dict[str, str] | None = None, calls: list[str] | None = None) -> ET43:
