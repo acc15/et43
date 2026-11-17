@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Frequency sweep with CSV output."""
 
+import asyncio
 import csv
 import math
-import time
 from pathlib import Path
 
 from et43 import ET43, Equivalent, PrimaryMode, SecondaryMode
@@ -34,24 +34,25 @@ def frequency_points(start: int, stop: int, points: int, *, logarithmic: bool) -
     return result
 
 
-def main() -> None:
+async def main() -> None:
     output = Path("sweep.csv")
     frequencies = frequency_points(100, 100_000, 25, logarithmic=True)
 
-    with ET43.open().auto_remote() as lcr:
-        lcr.mode = PrimaryMode.C
-        lcr.secondary = SecondaryMode.ESR
-        lcr.level_mv = 1_000
-        lcr.equivalent = Equivalent.SER
+    async with (await ET43.open()).auto_remote() as lcr:
+        await lcr.set_mode(PrimaryMode.C)
+        await lcr.set_secondary(SecondaryMode.ESR)
+        await lcr.set_level_mv(1_000)
+        await lcr.set_equivalent(Equivalent.SER)
 
-        with output.open("w", newline="", encoding="utf-8") as handle:
+        # Local CSV I/O is tiny; keep the example simple.
+        with output.open("w", newline="", encoding="utf-8") as handle:  # noqa: ASYNC230
             writer = csv.DictWriter(handle, fieldnames=["frequency_hz", "primary", "secondary"])
             writer.writeheader()
 
             for frequency in frequencies:
-                lcr.frequency = frequency
-                time.sleep(SETTLE)
-                primary, secondary = lcr.fetch()
+                await lcr.set_frequency(frequency)
+                await asyncio.sleep(SETTLE)
+                primary, secondary = await lcr.fetch()
                 secondary_text = "—" if secondary is None else f"{secondary:.6g}"
                 print(f"{frequency:>7} Hz   {primary:.6g}   {secondary_text}")
                 writer.writerow(
@@ -66,4 +67,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

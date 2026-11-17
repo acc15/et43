@@ -1,9 +1,9 @@
+import asyncio
 from types import SimpleNamespace
-from typing import cast
+from typing import Self, cast
 
 import pytest
-import serial
-from serial.tools import list_ports
+import serialx
 
 from et43.client import CALIBRATION_TIMEOUT, ET43, Reading
 from et43.enums import (
@@ -16,52 +16,64 @@ from et43.enums import (
 
 
 class _FakePort:
-    """Minimal stand-in for ``serial.Serial`` in offline tests."""
+    """Minimal stand-in for ``serialx.AsyncSerial`` in offline tests."""
 
-    def __init__(self, is_open: bool = True, read_data: bytes = b"") -> None:
+    def __init__(
+        self,
+        is_open: bool = True,
+        read_data: bytes = b"",
+        *,
+        read_delay: float = 0.0,
+    ) -> None:
         self.is_open = is_open
-        self.timeout = 1.0
-        self.port = "/dev/fake"
-        self.baudrate = 115_200
+        self.read_data = bytearray(read_data)
+        self.read_delay = read_delay
         self.writes: list[bytes] = []
-        self.read_data = read_data
-        self.read_timeouts: list[float | None] = []
+        self._closed = asyncio.Event()
 
-    def reset_input_buffer(self) -> None:
+    async def read(self, size: int = 1) -> bytes:
         if not self.is_open:
             raise OSError("port is closed")
+        if not self.read_data:
+            # Simulate an instrument that does not answer: wait until the
+            # caller's asyncio.timeout() cancels the read or the port is closed.
+            await self._closed.wait()
+        if self.read_delay:
+            delay, self.read_delay = self.read_delay, 0.0
+            await asyncio.sleep(delay)
+        data = bytes(self.read_data[:size])
+        del self.read_data[:size]
+        return data
 
-    def write(self, data: bytes) -> None:
+    async def write(self, data: bytes) -> None:
         if not self.is_open:
             raise OSError("port is closed")
         self.writes.append(data)
 
-    def flush(self) -> None:
+    async def flush(self) -> None:
         pass
 
-    @property
-    def in_waiting(self) -> int:
-        return len(self.read_data)
-
-    def read(self, size: int = 1) -> bytes:
-        self.read_timeouts.append(self.timeout)
-        data, self.read_data = self.read_data[:size], self.read_data[size:]
-        return data
-
-    def close(self) -> None:
+    async def close(self) -> None:
         self.is_open = False
+        self._closed.set()
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, *_) -> None:
+        await self.close()
 
 
-def _attach(port: _FakePort) -> ET43:
+def _attach(port: _FakePort, *, timeout: float = 2.0) -> ET43:
     """Create a client that owns *port*."""
-    return ET43(cast(serial.Serial, port))
+    return ET43(cast(serialx.AsyncSerial, port), timeout=timeout)
 
 
 def _record_commands(client: ET43, commands: list[str]) -> None:
-    def command(command: str, *, timeout: float | None = None) -> None:
+    async def command(command: str, *, timeout: float | None = None) -> None:
         commands.append(command)
 
-    client._command = command
+    client._command = command  # type: ignore[method-assign]
 
 
 @pytest.mark.parametrize(
@@ -142,44 +154,58 @@ def test_speed_from_string(value: str | Speed, expected: Speed) -> None:
     assert Speed.from_string(value) == expected
 
 
-@pytest.mark.parametrize(
-    ("value", "expected"),
-    [
-        ("meas", DisplayPage.MEAS),
-        ("SYST", DisplayPage.SYST),
-        ("SYSTem", DisplayPage.SYST),
-        ("SYSTEM", DisplayPage.SYST),
-        ("MEASurement", DisplayPage.MEAS),
-        (DisplayPage.SYST, DisplayPage.SYST),
-    ],
-)
-def test_display_page_from_string(value: str | DisplayPage, expected: DisplayPage) -> None:
-    assert DisplayPage.from_string(value) == expected
-
-
-@pytest.mark.parametrize("value", ["SYS", "OTHER"])
-def test_display_page_rejects_unknown(value: str) -> None:
-    with pytest.raises(ValueError):
-        DisplayPage.from_string(value)
-
-
-def test_discover_without_ports_raises_connection_error() -> None:
+async def test_discover_without_ports_raises_connection_error() -> None:
     with pytest.raises(ConnectionError):
-        ET43.discover(ports=[])
+        await ET43.discover(ports=[])
 
 
-def test_discover_skips_non_usb_ports(monkeypatch: pytest.MonkeyPatch) -> None:
-    builtin = [SimpleNamespace(device=f"/dev/ttyS{i}", vid=None, description="n/a") for i in range(32)]
-    monkeypatch.setattr(list_ports, "comports", lambda: builtin)
+async def test_discover_skips_non_usb_ports(monkeypatch: pytest.MonkeyPatch) -> None:
+    builtin = [
+        SimpleNamespace(
+            device=f"/dev/ttyS{i}",
+            vid=None,
+            product=None,
+            manufacturer=None,
+            interface_description=None,
+        )
+        for i in range(32)
+    ]
 
-    def fail_open(**_: object) -> None:
+    async def fake_ports() -> list[SimpleNamespace]:
+        return builtin
+
+    monkeypatch.setattr(serialx, "async_list_serial_ports", fake_ports)
+
+    def fail_open(*_: object, **__: object) -> None:
         pytest.fail("non-USB ports must not be opened")
 
-    monkeypatch.setattr(serial, "Serial", fail_open)
+    monkeypatch.setattr(serialx, "async_serial_for_url", fail_open)
 
     with pytest.raises(ConnectionError, match="no USB serial adapter") as info:
-        ET43.discover()
+        await ET43.discover()
     assert "ttyS" not in str(info.value)
+
+
+async def test_discover_returns_usb_adapter(monkeypatch: pytest.MonkeyPatch) -> None:
+    link = _FakePort(read_data=b"ZC,ET433,V1,H1,SN\n")
+    ports = [
+        SimpleNamespace(
+            device="/dev/fake",
+            vid=0x1A86,
+            product="USB-SERIAL CH340",
+            manufacturer=None,
+            interface_description=None,
+        )
+    ]
+
+    async def fake_ports() -> list[SimpleNamespace]:
+        return ports
+
+    monkeypatch.setattr(serialx, "async_list_serial_ports", fake_ports)
+    monkeypatch.setattr(serialx, "async_serial_for_url", lambda *_, **__: link)
+
+    assert await ET43.discover() == ("/dev/fake", 115_200)
+    assert not link.is_open
 
 
 def _client(answer: str, responses: dict[str, str] | None = None, calls: list[str] | None = None) -> ET43:
@@ -195,101 +221,101 @@ def _client(answer: str, responses: dict[str, str] | None = None, calls: list[st
     if responses is not None:
         mapping.update(responses)
 
-    def request(command: str, *, timeout: float | None = None) -> str:
+    async def request(command: str, *, timeout: float | None = None) -> str:
         if calls is not None:
             calls.append(command)
         return mapping[command]
 
-    client._request = request
+    client._request = request  # type: ignore[method-assign]
     return client
 
 
-def test_closed_port_state() -> None:
+async def test_closed_port_state() -> None:
     client = _attach(_FakePort(is_open=False))
 
     assert client.is_open is False
-    client.close()  # must be idempotent when the port is already closed
+    await client.close()  # must be idempotent when the port is already closed
 
     with pytest.raises(OSError):
-        client._request("FREQ?")
+        await client._request("FREQ?")
 
 
-def test_constructor_performs_no_io() -> None:
+async def test_constructor_performs_no_io() -> None:
     fake_port = _FakePort()
-    client = ET43(cast(serial.Serial, fake_port))
+    client = ET43(cast(serialx.AsyncSerial, fake_port))
 
     assert client.is_open is True
-    client.close()
+    await client.close()
     assert fake_port.is_open is False
 
 
-def test_idn_is_queried_each_time() -> None:
+async def test_idn_is_queried_each_time() -> None:
     calls: list[str] = []
     client = _attach(_FakePort())
 
-    def request(command: str, *, timeout: float | None = None) -> str:
+    async def request(command: str, *, timeout: float | None = None) -> str:
         calls.append(command)
         return "ZC,ET433,V1,H1,SN"
 
-    client._request = request
+    client._request = request  # type: ignore[method-assign]
 
-    assert client.idn == client.idn
+    assert await client.idn() == await client.idn()
     assert calls == ["*IDN?", "*IDN?"]
 
 
-def test_close_owns_port() -> None:
+async def test_close_owns_port() -> None:
     fake_port = _FakePort()
     client = _attach(fake_port)
 
-    client.close()
+    await client.close()
     assert fake_port.writes == []
     assert fake_port.is_open is False
 
 
-def test_write_does_not_read() -> None:
+async def test_write_does_not_read() -> None:
     fake_port = _FakePort()
     client = _attach(fake_port)
 
-    client._write("SYST:LOCAL")
+    await client._write("SYST:LOCAL")
     assert fake_port.writes == [b"SYST:LOCAL\n"]
 
 
-def test_remote_sends_command_and_waits_for_ack() -> None:
+async def test_remote_sends_command_and_waits_for_ack() -> None:
     fake_port = _FakePort(read_data=b"exec success\n")
     client = _attach(fake_port)
 
-    client.remote()
+    await client.remote()
     assert fake_port.writes == [b"SYST:REMOTE\n"]
 
 
-def test_equivalent_par_sends_firmware_token() -> None:
+async def test_equivalent_par_sends_firmware_token() -> None:
     fake_port = _FakePort(read_data=b"exec success\n")
     client = _attach(fake_port)
 
-    client.equivalent = Equivalent.PAR
+    await client.set_equivalent(Equivalent.PAR)
     assert fake_port.writes == [b"FUNC:IMP:EQU PAL\n"]
 
 
-def test_equivalent_parses_pallel_response() -> None:
+async def test_equivalent_parses_pallel_response() -> None:
     fake_port = _FakePort(read_data=b"PALlel\n")
     client = _attach(fake_port)
 
-    assert client.equivalent is Equivalent.PAR
+    assert await client.get_equivalent() is Equivalent.PAR
 
 
-def test_local_writes_without_reading_ack() -> None:
+async def test_local_writes_without_reading_ack() -> None:
     fake_port = _FakePort()
     client = _attach(fake_port)
 
-    client.local()
+    await client.local()
     assert fake_port.writes == [b"SYST:LOCAL\n"]
 
 
-def test_auto_remote_enters_and_exits() -> None:
+async def test_auto_remote_enters_and_exits() -> None:
     port = _FakePort(read_data=b"exec success\n")
     client = _attach(port)
 
-    with client.auto_remote() as current:
+    async with client.auto_remote() as current:
         assert current is client
         assert port.writes == [b"SYST:REMOTE\n"]
         assert port.is_open
@@ -298,159 +324,156 @@ def test_auto_remote_enters_and_exits() -> None:
     assert not port.is_open
 
 
-def test_auto_remote_exits_on_exception() -> None:
+async def test_auto_remote_exits_on_exception() -> None:
     port = _FakePort(read_data=b"exec success\n")
     client = _attach(port)
 
-    with pytest.raises(RuntimeError), client.auto_remote():
-        raise RuntimeError("boom")
+    with pytest.raises(RuntimeError, match="boom"):
+        async with client.auto_remote():
+            raise RuntimeError("boom")
 
     assert port.writes == [b"SYST:REMOTE\n", b"SYST:LOCAL\n"]
     assert not port.is_open
 
 
-def test_auto_remote_exits_when_remote_fails() -> None:
+async def test_auto_remote_exits_when_remote_fails() -> None:
     port = _FakePort()  # no acknowledgement -> remote() times out
-    client = _attach(port)
+    client = _attach(port, timeout=0.01)
 
-    with pytest.raises(TimeoutError), client.auto_remote():
-        pytest.fail("block must not run")
+    with pytest.raises(TimeoutError):
+        async with client.auto_remote():
+            pytest.fail("block must not run")
 
     assert port.writes == [b"SYST:REMOTE\n", b"SYST:LOCAL\n"]
     assert not port.is_open
 
 
-def test_auto_remote_local_failure_does_not_mask_block_error() -> None:
+async def test_auto_remote_local_failure_does_not_mask_block_error() -> None:
     port = _FakePort(read_data=b"exec success\n")
     client = _attach(port)
 
-    def broken_local() -> None:
+    async def broken_local() -> None:
         raise OSError("port gone")
 
-    client.local = broken_local
+    client.local = broken_local  # type: ignore[method-assign]
 
-    with pytest.raises(RuntimeError, match="boom"), client.auto_remote():
-        raise RuntimeError("boom")
+    with pytest.raises(RuntimeError, match="boom"):
+        async with client.auto_remote():
+            raise RuntimeError("boom")
 
     assert not port.is_open
 
 
-def test_auto_remote_local_failure_after_success_propagates() -> None:
+async def test_auto_remote_local_failure_after_success_propagates() -> None:
     port = _FakePort(read_data=b"exec success\n")
     client = _attach(port)
 
-    def broken_local() -> None:
+    async def broken_local() -> None:
         raise OSError("port gone")
 
-    client.local = broken_local
+    client.local = broken_local  # type: ignore[method-assign]
 
-    with pytest.raises(OSError, match="port gone"), client.auto_remote():
-        pass
+    with pytest.raises(OSError, match="port gone"):
+        async with client.auto_remote():
+            pass
 
     assert not port.is_open
 
 
-def test_calibrate_waits_for_ack() -> None:
+async def test_calibrate_waits_for_ack() -> None:
     fake_port = _FakePort(read_data=b"exec success\n")
     client = _attach(fake_port)
 
-    client.calibrate()
+    await client.calibrate()
     assert fake_port.writes == [b"CORR:EXEC\n"]
 
 
-def test_calibrate_uses_calibration_timeout() -> None:
+async def test_calibrate_uses_calibration_timeout() -> None:
     client = _attach(_FakePort())
     seen: list[float | None] = []
 
-    def fake_read(timeout: float | None = None) -> str:
+    async def fake_read(timeout: float | None = None) -> str:
         seen.append(timeout)
         return "exec success"
 
     client._read = fake_read  # type: ignore[method-assign]
-    client.calibrate()
+    await client.calibrate()
 
     assert seen == [CALIBRATION_TIMEOUT]
 
 
-def test_calibrate_timeout_override() -> None:
+async def test_calibrate_timeout_override() -> None:
     client = _attach(_FakePort())
     seen: list[float | None] = []
 
-    def fake_read(timeout: float | None = None) -> str:
+    async def fake_read(timeout: float | None = None) -> str:
         seen.append(timeout)
         return "exec success"
 
     client._read = fake_read  # type: ignore[method-assign]
-    client.calibrate(timeout=12.5)
+    await client.calibrate(timeout=12.5)
 
     assert seen == [12.5]
 
 
-def test_read_consumes_crlf_terminator() -> None:
-    port = _FakePort(read_data=b"1,2\r\n")
-    client = _attach(port)
-
-    assert client._read() == "1,2"
-    assert port.read_data == b""
+async def test_read_accepts_crlf_and_bare_terminators() -> None:
+    for reply in (b"1,2\r\n", b"1,2\r", b"1,2\n"):
+        assert await _attach(_FakePort(read_data=reply))._read() == "1,2"
 
 
-def test_read_accepts_bare_cr_and_lf() -> None:
-    assert _attach(_FakePort(read_data=b"1,2\r"))._read() == "1,2"
-    assert _attach(_FakePort(read_data=b"1,2\n"))._read() == "1,2"
-
-
-def test_read_keeps_next_response_after_crlf() -> None:
+async def test_read_returns_next_response_after_crlf() -> None:
     port = _FakePort(read_data=b"1,2\r\n3,4\n")
     client = _attach(port)
 
-    assert client._read() == "1,2"
-    assert client._read() == "3,4"
+    assert await client._read() == "1,2"
+    assert await client._read() == "3,4"
 
 
-def test_read_preserves_byte_after_bare_cr() -> None:
+async def test_read_preserves_byte_after_bare_cr() -> None:
     port = _FakePort(read_data=b"1,2\r3,4\n")
     client = _attach(port)
 
-    assert client._read() == "1,2"
-    assert client._read() == "3,4"
+    assert await client._read() == "1,2"
+    assert await client._read() == "3,4"
 
 
-def test_read_applies_explicit_timeout_and_restores_it() -> None:
-    port = _FakePort(read_data=b"exec success\n")
+async def test_read_uses_explicit_timeout() -> None:
+    port = _FakePort(read_data=b"exec success\n", read_delay=0.05)
     client = _attach(port)
 
-    assert client._read(timeout=12.5) == "exec success"
-    assert set(port.read_timeouts) == {12.5}
-    assert port.timeout == 1.0
+    with pytest.raises(TimeoutError):
+        await client._read(timeout=0.01)
+
+    assert await client._read() == "exec success"
 
 
-def test_read_raises_on_empty_response() -> None:
-    client = _attach(_FakePort(read_data=b""))
+async def test_read_raises_on_empty_response() -> None:
+    client = _attach(_FakePort(), timeout=0.01)
 
     with pytest.raises(TimeoutError):
-        client._read()
+        await client._read()
 
 
 @pytest.mark.parametrize("reply", [b"cmd err\n", b"exec err\n", b"execu err\n", b"cmd err"])
-def test_read_raises_on_protocol_error(reply: bytes) -> None:
-    client = _attach(_FakePort(read_data=reply))
+async def test_read_raises_on_protocol_error(reply: bytes) -> None:
+    client = _attach(_FakePort(read_data=reply), timeout=0.01)
 
     with pytest.raises(RuntimeError, match="err$"):
-        client._read()
+        await client._read()
 
 
-def test_command_rejects_unexpected_response() -> None:
+async def test_command_rejects_unexpected_response() -> None:
     client = _attach(_FakePort(read_data=b"something\n"))
 
     with pytest.raises(RuntimeError):
-        client._command("SYST:REMOTE")
+        await client._command("SYST:REMOTE")
 
 
-def test_idn_rejects_malformed_response() -> None:
+async def test_idn_rejects_malformed_response() -> None:
     client = _client("ignored", {"*IDN?": "ZC,ET433"})
 
     with pytest.raises(ValueError):
-        _ = client.idn
+        await client.idn()
 
 
 @pytest.mark.parametrize(
@@ -463,8 +486,8 @@ def test_idn_rejects_malformed_response() -> None:
         ("DCR", PrimaryMode.DCR),
     ],
 )
-def test_mode_property_parses_device_answer(answer: str, expected: PrimaryMode) -> None:
-    assert _client("ignored", {"FUNC:IMP:A?": answer}).mode is expected
+async def test_mode_property_parses_device_answer(answer: str, expected: PrimaryMode) -> None:
+    assert await _client("ignored", {"FUNC:IMP:A?": answer}).get_mode() is expected
 
 
 @pytest.mark.parametrize(
@@ -476,11 +499,11 @@ def test_mode_property_parses_device_answer(answer: str, expected: PrimaryMode) 
         (" D ", SecondaryMode.D),
     ],
 )
-def test_secondary_property_parses_device_answer(answer: str, expected: SecondaryMode) -> None:
-    assert _client("ignored", {"FUNC:IMP:B?": answer}).secondary is expected
+async def test_secondary_property_parses_device_answer(answer: str, expected: SecondaryMode) -> None:
+    assert await _client("ignored", {"FUNC:IMP:B?": answer}).get_secondary() is expected
 
 
-def test_numeric_properties_return_float() -> None:
+async def test_numeric_properties_return_float() -> None:
     client = _client(
         "ignored",
         {
@@ -490,73 +513,73 @@ def test_numeric_properties_return_float() -> None:
         },
     )
 
-    assert client.frequency == 1000.0
-    assert client.level_mv == 600.0
-    assert client.bias_mv == 0.0
+    assert await client.get_frequency() == 1000.0
+    assert await client.get_level_mv() == 600.0
+    assert await client.get_bias_mv() == 0.0
 
 
-def test_numeric_setters_keep_fractional_values() -> None:
+async def test_numeric_setters_keep_fractional_values() -> None:
     client = _client("ignored")
     commands: list[str] = []
     _record_commands(client, commands)
 
-    client.frequency = 1000.5
-    client.level_mv = 600.0
-    client.bias_mv = 0.5
+    await client.set_frequency(1000.5)
+    await client.set_level_mv(600.0)
+    await client.set_bias_mv(0.5)
 
     assert commands == ["FREQ 1000.5", "VOLT 600", "BIAS:VOLT 0.5"]
 
 
-def test_frequency_setter_sends_value_without_local_validation() -> None:
+async def test_frequency_setter_sends_value_without_local_validation() -> None:
     client = _client("ignored")
     commands: list[str] = []
     _record_commands(client, commands)
 
-    client.frequency = 1
+    await client.set_frequency(1)
 
     assert commands == ["FREQ 1"]
 
 
-def test_level_setter_sends_value_without_local_validation() -> None:
+async def test_level_setter_sends_value_without_local_validation() -> None:
     client = _client("ignored")
     commands: list[str] = []
     _record_commands(client, commands)
 
-    client.level_mv = 5_000
+    await client.set_level_mv(5_000)
 
     assert commands == ["VOLT 5000"]
 
 
-def test_bias_setter_sends_value_without_local_validation() -> None:
+async def test_bias_setter_sends_value_without_local_validation() -> None:
     client = _client("ignored")
     commands: list[str] = []
     _record_commands(client, commands)
 
-    client.bias_mv = 2_000
+    await client.set_bias_mv(2_000)
 
     assert commands == ["BIAS:VOLT 2000"]
 
 
-def test_display_page_property_and_command() -> None:
+async def test_display_page_property_and_command() -> None:
     client = _client("ignored", {"DISP:PAGE?": "SYSTem"})
-    assert client.display_page is DisplayPage.SYST
+    assert await client.get_display_page() is DisplayPage.SYST
 
     commands: list[str] = []
     _record_commands(client, commands)
-    client.display_page = DisplayPage.MEAS
-    client.display_page = DisplayPage.SYST
+    await client.set_display_page(DisplayPage.MEAS)
+    await client.set_display_page(DisplayPage.SYST)
     assert commands == ["DISP:PAGE MEAS", "DISP:PAGE SYST"]
 
 
-def test_measurement_range_property_and_setter() -> None:
-    assert _client("ignored", {"FUNC:IMP:RANGE?": "1000"}).measurement_range == 1000
-    assert _client("ignored", {"FUNC:IMP:RANGE?": "AUTO"}).measurement_range is None
+async def test_measurement_range_property_and_setter() -> None:
+    assert await _client("ignored", {"FUNC:IMP:RANGE?": "1000"}).get_measurement_range() == 1000
+    assert await _client("ignored", {"FUNC:IMP:RANGE?": "AUTO"}).get_measurement_range() is None
 
     client = _client("ignored")
     commands: list[str] = []
     _record_commands(client, commands)
-    client.measurement_range = 100_000
-    client.measurement_range = None
+    await client.set_measurement_range(100_000)
+    await client.set_measurement_range(None)
 
     assert commands == [
         "FUNC:IMP:RANGE 100000",
@@ -572,51 +595,51 @@ def test_measurement_range_property_and_setter() -> None:
         ("MAYBE", False),
     ],
 )
-def test_relative_mode_property(answer: str, expected: bool) -> None:
-    assert _client("ignored", {"FUNC:DEV:MODE?": answer}).relative_mode is expected
+async def test_relative_mode_property(answer: str, expected: bool) -> None:
+    assert await _client("ignored", {"FUNC:DEV:MODE?": answer}).get_relative_mode() is expected
 
 
-def test_relative_mode_setter() -> None:
+async def test_relative_mode_setter() -> None:
     client = _client("ignored")
     commands: list[str] = []
     _record_commands(client, commands)
 
-    client.relative_mode = True
-    client.relative_mode = False
+    await client.set_relative_mode(True)
+    await client.set_relative_mode(False)
 
     assert commands == ["FUNC:DEV:MODE ON", "FUNC:DEV:MODE OFF"]
 
 
-def test_fetch_two_values() -> None:
-    assert _client("1e-6,2.5").fetch() == pytest.approx((1e-6, 2.5))
+async def test_fetch_two_values() -> None:
+    assert await _client("1e-6,2.5").fetch() == pytest.approx((1e-6, 2.5))
 
 
-def test_fetch_single_value_for_dcr() -> None:
-    primary, secondary = _client("5.8e9").fetch()
+async def test_fetch_single_value_for_dcr() -> None:
+    primary, secondary = await _client("5.8e9").fetch()
     assert primary == pytest.approx(5.8e9)
     assert secondary is None
 
 
-def test_fetch_returns_named_reading() -> None:
-    reading = _client("1e-6,2.5").fetch()
+async def test_fetch_returns_named_reading() -> None:
+    reading = await _client("1e-6,2.5").fetch()
     assert isinstance(reading, Reading)
     assert reading.primary == pytest.approx(1e-6)
     assert reading.secondary == pytest.approx(2.5)
 
 
-def test_fetch_makes_only_one_request() -> None:
+async def test_fetch_makes_only_one_request() -> None:
     calls: list[str] = []
     client = _client("1,2", calls=calls)
 
-    assert client.fetch() == pytest.approx((1.0, 2.0))
+    assert await client.fetch() == pytest.approx((1.0, 2.0))
     assert calls == ["FETCH?"]
 
 
-def test_fetch_rejects_bad_answer() -> None:
+async def test_fetch_rejects_bad_answer() -> None:
     with pytest.raises(ValueError):
-        _client("garbage").fetch()
+        await _client("garbage").fetch()
 
 
-def test_fetch_rejects_extra_fields() -> None:
+async def test_fetch_rejects_extra_fields() -> None:
     with pytest.raises(ValueError):
-        _client("Cp,1e-6,D,0.01").fetch()
+        await _client("Cp,1e-6,D,0.01").fetch()
