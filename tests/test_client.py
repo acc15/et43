@@ -1,4 +1,5 @@
 import asyncio
+import time
 from types import SimpleNamespace
 from typing import Self, cast
 
@@ -23,11 +24,15 @@ class _FakePort:
         is_open: bool = True,
         read_data: bytes = b"",
         *,
+        response: bytes = b"",
         read_delay: float = 0.0,
+        eof: bool = False,
     ) -> None:
         self.is_open = is_open
         self.read_data = bytearray(read_data)
+        self.response = bytearray(response)
         self.read_delay = read_delay
+        self.eof = eof
         self.writes: list[bytes] = []
         self._closed = asyncio.Event()
 
@@ -37,6 +42,8 @@ class _FakePort:
         if not self.read_data:
             # Simulate an instrument that does not answer: wait until the
             # caller's asyncio.timeout() cancels the read or the port is closed.
+            if self.eof:
+                return b""
             await self._closed.wait()
         if self.read_delay:
             delay, self.read_delay = self.read_delay, 0.0
@@ -49,6 +56,9 @@ class _FakePort:
         if not self.is_open:
             raise OSError("port is closed")
         self.writes.append(data)
+        if self.response:
+            self.read_data.extend(self.response)
+            self.response.clear()
 
     async def flush(self) -> None:
         pass
@@ -64,9 +74,9 @@ class _FakePort:
         await self.close()
 
 
-def _attach(port: _FakePort, *, timeout: float = 2.0) -> ET43:
+def _attach(port: _FakePort, *, timeout: float = 2.0, settle: float = 0.05) -> ET43:
     """Create a client that owns *port*."""
-    return ET43(cast(serialx.AsyncSerial, port), timeout=timeout)
+    return ET43(cast(serialx.AsyncSerial, port), timeout=timeout, settle=settle)
 
 
 def _record_commands(client: ET43, commands: list[str]) -> None:
@@ -187,7 +197,7 @@ async def test_discover_skips_non_usb_ports(monkeypatch: pytest.MonkeyPatch) -> 
 
 
 async def test_discover_returns_usb_adapter(monkeypatch: pytest.MonkeyPatch) -> None:
-    link = _FakePort(read_data=b"ZC,ET433,V1,H1,SN\n")
+    link = _FakePort(response=b"ZC,ET433,V1,H1,SN\n")
     ports = [
         SimpleNamespace(
             device="/dev/fake",
@@ -227,6 +237,7 @@ def _client(answer: str, responses: dict[str, str] | None = None, calls: list[st
         return mapping[command]
 
     client._request = request  # type: ignore[method-assign]
+    client._remote = True
     return client
 
 
@@ -281,23 +292,25 @@ async def test_write_does_not_read() -> None:
 
 
 async def test_remote_sends_command_and_waits_for_ack() -> None:
-    fake_port = _FakePort(read_data=b"exec success\n")
+    fake_port = _FakePort(response=b"exec success\n")
     client = _attach(fake_port)
 
     await client.remote()
     assert fake_port.writes == [b"SYST:REMOTE\n"]
+    assert client._remote is True
 
 
 async def test_equivalent_par_sends_firmware_token() -> None:
-    fake_port = _FakePort(read_data=b"exec success\n")
+    fake_port = _FakePort(response=b"exec success\n")
     client = _attach(fake_port)
+    client._remote = True
 
     await client.set_equivalent(Equivalent.PAR)
     assert fake_port.writes == [b"FUNC:IMP:EQU PAL\n"]
 
 
 async def test_equivalent_parses_pallel_response() -> None:
-    fake_port = _FakePort(read_data=b"PALlel\n")
+    fake_port = _FakePort(response=b"PALlel\n")
     client = _attach(fake_port)
 
     assert await client.get_equivalent() is Equivalent.PAR
@@ -306,13 +319,40 @@ async def test_equivalent_parses_pallel_response() -> None:
 async def test_local_writes_without_reading_ack() -> None:
     fake_port = _FakePort()
     client = _attach(fake_port)
+    client._remote = True
 
     await client.local()
     assert fake_port.writes == [b"SYST:LOCAL\n"]
+    assert client._remote is False
+
+
+async def test_local_sleeps_settle() -> None:
+    fake_port = _FakePort()
+    client = _attach(fake_port, settle=0.02)
+    client._remote = True
+
+    started = time.monotonic()
+    await client.local()
+
+    assert time.monotonic() - started >= 0.015
+    assert fake_port.writes == [b"SYST:LOCAL\n"]
+    assert client._remote is False
+
+
+async def test_local_without_settle_does_not_wait() -> None:
+    fake_port = _FakePort()
+    client = _attach(fake_port, settle=0)
+    client._remote = True
+
+    async with asyncio.timeout(0.01):
+        await client.local()
+
+    assert fake_port.writes == [b"SYST:LOCAL\n"]
+    assert client._remote is False
 
 
 async def test_auto_remote_enters_and_exits() -> None:
-    port = _FakePort(read_data=b"exec success\n")
+    port = _FakePort(response=b"exec success\n")
     client = _attach(port)
 
     async with client.auto_remote() as current:
@@ -325,7 +365,7 @@ async def test_auto_remote_enters_and_exits() -> None:
 
 
 async def test_auto_remote_exits_on_exception() -> None:
-    port = _FakePort(read_data=b"exec success\n")
+    port = _FakePort(response=b"exec success\n")
     client = _attach(port)
 
     with pytest.raises(RuntimeError, match="boom"):
@@ -349,7 +389,7 @@ async def test_auto_remote_exits_when_remote_fails() -> None:
 
 
 async def test_auto_remote_local_failure_does_not_mask_block_error() -> None:
-    port = _FakePort(read_data=b"exec success\n")
+    port = _FakePort(response=b"exec success\n")
     client = _attach(port)
 
     async def broken_local() -> None:
@@ -365,7 +405,7 @@ async def test_auto_remote_local_failure_does_not_mask_block_error() -> None:
 
 
 async def test_auto_remote_local_failure_after_success_propagates() -> None:
-    port = _FakePort(read_data=b"exec success\n")
+    port = _FakePort(response=b"exec success\n")
     client = _attach(port)
 
     async def broken_local() -> None:
@@ -381,7 +421,7 @@ async def test_auto_remote_local_failure_after_success_propagates() -> None:
 
 
 async def test_calibrate_waits_for_ack() -> None:
-    fake_port = _FakePort(read_data=b"exec success\n")
+    fake_port = _FakePort(response=b"exec success\n")
     client = _attach(fake_port)
 
     await client.calibrate()
@@ -454,6 +494,81 @@ async def test_read_raises_on_empty_response() -> None:
         await client._read()
 
 
+async def test_write_always_drains_stale_input() -> None:
+    port = _FakePort(read_data=b"stale\n", eof=True)
+    client = _attach(port)
+
+    await client._write("FETCH?")
+
+    assert port.read_data == b""
+    assert port.writes == [b"FETCH?\n"]
+
+
+async def test_local_setter_does_not_wait() -> None:
+    port = _FakePort()
+    client = _attach(port, settle=0)
+    assert client._remote is False
+
+    async with asyncio.timeout(0.1):
+        await client.set_frequency(1_000)
+
+    assert port.writes == [b"FREQ 1000\n"]
+
+
+async def test_local_setter_sleeps_settle() -> None:
+    port = _FakePort()
+    client = _attach(port, settle=0.02)
+
+    started = time.monotonic()
+    await client.set_frequency(1_000)
+
+    assert time.monotonic() - started >= 0.015
+    assert port.writes == [b"FREQ 1000\n"]
+
+
+async def test_remote_setter_waits_for_ack() -> None:
+    port = _FakePort(response=b"exec success\n")
+    client = _attach(port)
+    client._remote = True
+
+    await client.set_frequency(1_000)
+
+    assert port.writes == [b"FREQ 1000\n"]
+    assert port.read_data == b""
+
+
+async def test_remote_setter_does_not_sleep() -> None:
+    port = _FakePort(response=b"exec success\n")
+    client = _attach(port, settle=0.2)
+    client._remote = True
+
+    started = time.monotonic()
+    await client.set_frequency(1_000)
+
+    assert time.monotonic() - started < 0.1
+    assert port.writes == [b"FREQ 1000\n"]
+
+
+async def test_remote_setter_raises_on_exec_err() -> None:
+    port = _FakePort(response=b"exec err\n")
+    client = _attach(port)
+    client._remote = True
+
+    with pytest.raises(RuntimeError, match="err$"):
+        await client.set_frequency(1_000)
+
+
+async def test_local_setter_does_not_check_errors() -> None:
+    port = _FakePort(response=b"exec err\n")
+    client = _attach(port, settle=0)
+    assert client._remote is False
+
+    await client.set_frequency(1_000)
+
+    assert port.writes == [b"FREQ 1000\n"]
+    assert port.read_data == b"exec err\n"
+
+
 @pytest.mark.parametrize("reply", [b"cmd err\n", b"exec err\n", b"execu err\n", b"cmd err"])
 async def test_read_raises_on_protocol_error(reply: bytes) -> None:
     client = _attach(_FakePort(read_data=reply), timeout=0.01)
@@ -463,7 +578,7 @@ async def test_read_raises_on_protocol_error(reply: bytes) -> None:
 
 
 async def test_command_rejects_unexpected_response() -> None:
-    client = _attach(_FakePort(read_data=b"something\n"))
+    client = _attach(_FakePort(response=b"something\n"))
 
     with pytest.raises(RuntimeError):
         await client._command("SYST:REMOTE")
@@ -573,13 +688,13 @@ async def test_display_page_property_and_command() -> None:
 
 async def test_measurement_range_property_and_setter() -> None:
     assert await _client("ignored", {"FUNC:IMP:RANGE?": "1000"}).get_measurement_range() == 1000
-    assert await _client("ignored", {"FUNC:IMP:RANGE?": "AUTO"}).get_measurement_range() is None
+    assert await _client("ignored", {"FUNC:IMP:RANGE?": "AUTO"}).get_measurement_range() == 0
 
     client = _client("ignored")
     commands: list[str] = []
     _record_commands(client, commands)
     await client.set_measurement_range(100_000)
-    await client.set_measurement_range(None)
+    await client.set_measurement_range(0)
 
     assert commands == [
         "FUNC:IMP:RANGE 100000",
@@ -608,6 +723,119 @@ async def test_relative_mode_setter() -> None:
     await client.set_relative_mode(False)
 
     assert commands == ["FUNC:DEV:MODE ON", "FUNC:DEV:MODE OFF"]
+
+
+async def test_configure_applies_only_provided() -> None:
+    client = _client("ignored")
+    commands: list[str] = []
+    _record_commands(client, commands)
+
+    await client.configure(frequency=500, delay=0)
+
+    assert commands == ["FREQ 500"]
+
+
+async def test_configure_all_parameters() -> None:
+    client = _client("ignored")
+    commands: list[str] = []
+    _record_commands(client, commands)
+
+    await client.configure(
+        mode=PrimaryMode.C,
+        secondary=SecondaryMode.ESR,
+        equivalent=Equivalent.SER,
+        frequency=1000,
+        level_mv=500,
+        bias_mv=10,
+        speed=Speed.FAST,
+        measurement_range=1000,
+        relative_mode=True,
+        delay=0,
+    )
+
+    assert commands == [
+        "FUNC:IMP:A C",
+        "FUNC:IMP:B ESR",
+        "FUNC:IMP:EQU SER",
+        "FREQ 1000",
+        "VOLT 500",
+        "BIAS:VOLT 10",
+        "APER FAST",
+        "FUNC:IMP:RANGE 1000",
+        "FUNC:DEV:MODE ON",
+    ]
+
+
+async def test_configure_measurement_range_auto() -> None:
+    client = _client("ignored")
+    commands: list[str] = []
+    _record_commands(client, commands)
+
+    await client.configure(measurement_range=0, delay=0)
+
+    assert commands == ["FUNC:IMP:RANGE AUTO"]
+
+
+async def test_configure_relative_mode_false() -> None:
+    client = _client("ignored")
+    commands: list[str] = []
+    _record_commands(client, commands)
+
+    await client.configure(relative_mode=False, delay=0)
+
+    assert commands == ["FUNC:DEV:MODE OFF"]
+
+
+async def test_configure_no_args() -> None:
+    client = _client("ignored")
+    commands: list[str] = []
+    _record_commands(client, commands)
+
+    await client.configure(delay=0)
+
+    assert commands == []
+
+
+async def test_configure_delay_sleeps() -> None:
+    client = _client("ignored")
+    commands: list[str] = []
+    _record_commands(client, commands)
+
+    started = time.monotonic()
+    await client.configure(frequency=500, delay=0.02)
+
+    assert time.monotonic() - started >= 0.015
+    assert commands == ["FREQ 500"]
+
+
+async def test_configure_delay_zero_does_not_sleep() -> None:
+    client = _client("ignored")
+    commands: list[str] = []
+    _record_commands(client, commands)
+
+    async with asyncio.timeout(0.01):
+        await client.configure(frequency=500, delay=0)
+
+    assert commands == ["FREQ 500"]
+
+
+async def test_configure_local_mode() -> None:
+    port = _FakePort()
+    client = _attach(port, settle=0)
+    assert client._remote is False
+
+    await client.configure(frequency=500, delay=0)
+
+    assert port.writes == [b"FREQ 500\n"]
+
+
+async def test_configure_remote_raises_exec_err() -> None:
+    port = _FakePort(response=b"exec err\n")
+    client = _attach(port, settle=0)
+    client._remote = True
+
+    with pytest.raises(RuntimeError, match="err$"):
+        await client.configure(level_mv=1101, delay=0)
 
 
 async def test_fetch_two_values() -> None:

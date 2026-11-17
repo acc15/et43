@@ -99,8 +99,10 @@ async with ET43(link, timeout=2.0).auto_remote() as lcr:
 The client always owns the port it is given: `close()` and leaving an
 `async with` block close it, even if you created the `serialx.AsyncSerial`
 yourself. The response timeout is the client's `timeout` argument (2 seconds by
-default); it is no longer read from the port. The port object is available as
-`lcr.port`.
+default); it is no longer read from the port. In local mode, setters and
+`local()` wait `settle` seconds (0.05 by default) after writing so the
+instrument can accept the next command; pass `settle=0` to disable the delay.
+The port object is available as `lcr.port`.
 
 The `ET43(link)` constructor performs no I/O. The first exchange happens on
 `await lcr.remote()`, `await lcr.fetch()` or another explicit call.
@@ -126,7 +128,7 @@ await lcr.set_level_mv(600)  # mV
 await lcr.set_bias_mv(100)  # mV
 await lcr.set_equivalent(Equivalent.SER)
 await lcr.set_speed(Speed.MED)
-await lcr.set_measurement_range(None)  # None = AUTO, a number = range in ohms
+await lcr.set_measurement_range(0)  # 0 = AUTO, a number = range in ohms
 await lcr.set_relative_mode(True)
 await lcr.set_display_page(DisplayPage.SYST)
 
@@ -140,8 +142,9 @@ Enum getters and setters (`get_mode`/`set_mode`, `get_secondary`/`set_secondary`
 getters return enum members. They are `StrEnum`s, so comparing with a string
 still works: `await lcr.get_mode() == "C"`.
 
-`get_measurement_range()` returns `int | None`: `None` means `AUTO`, otherwise
-it is the range resistance in ohms.
+`get_measurement_range()` returns `int`: `0` means `AUTO`, otherwise it is the
+range resistance in ohms. `None` is also accepted by the setter for backward
+compatibility.
 
 `get_frequency()`, `get_level_mv()` and `get_bias_mv()` return `float`, because
 SCPI returns them in NR3 format. In practice the ET433 works in 1 Hz / 1 mV
@@ -152,6 +155,11 @@ Valid ranges depend on the model, and the instrument decides how to handle an
 invalid value. For example, the ET433 silently ignores an out-of-range frequency
 or bias, and answers `exec err` to an invalid level or measurement range.
 
+In remote mode setters wait for `exec success` and raise `RuntimeError` on
+`exec err`. In local mode the ET433 applies settings without sending a reply;
+the client sends them fire-and-forget and does not report their status. Use
+`auto_remote()` or `remote()` when you want confirmation.
+
 Parsing helpers on the enums:
 
 ```python
@@ -160,6 +168,32 @@ PrimaryMode.from_string("c")  # PrimaryMode.C
 PrimaryMode.from_string("Cp")  # PrimaryMode.C (older firmware answers)
 Speed.from_string("MEDium")  # Speed.MED (instrument answer)
 ```
+
+## Configuration
+
+Apply several settings in one call with `configure()`. Every argument is
+optional; only the ones given are changed, in a sensible order:
+
+```python
+await lcr.configure(
+    mode=PrimaryMode.C,
+    secondary=SecondaryMode.ESR,
+    equivalent=Equivalent.SER,
+    frequency=1_000,
+    level_mv=1_000,
+    bias_mv=0,
+    speed=Speed.SLOW,
+    measurement_range=0,  # 0 = AUTO, a number = range in ohms
+    relative_mode=False,
+    delay=1.0,
+)
+primary, secondary = await lcr.fetch()  # value already stabilised
+```
+
+`delay` is the stabilisation time after applying everything (1 s by default);
+the instrument needs it to settle before a measurement is accurate. Set
+`delay=0` to skip. Setters are confirmed in remote mode and fire-and-forget
+in local mode.
 
 ## Measurements
 
@@ -225,15 +259,38 @@ the connection open across blocks, call `await lcr.remote()` and
 `await lcr.local()` yourself.
 
 In local mode the instrument answers queries (`FETCH?`, `FREQ?` and so on) but
-**ignores configuration commands**. The client reports this as an error rather
-than pretending the setting was applied:
+applies configuration commands without replying. The client sends them
+fire-and-forget, so a setter neither raises `TimeoutError` nor reports
+`exec err`. If you need validation, use `auto_remote()` or call
+`await lcr.remote()`:
 
 ```python
 lcr = await ET43.open("/dev/ttyUSB0")
 async with lcr:
     print(await lcr.fetch())  # queries work
-    await lcr.set_frequency(10_000)  # raises TimeoutError in local mode
+    await lcr.set_frequency(10_000)  # applied, no reply, no error
 ```
+
+The client remembers whether it entered remote mode. `open()` assumes local;
+`remote()` and `auto_remote()` enable acknowledgement checks, `local()` disables
+them. If you construct a client from an already-open link that is in remote
+mode, call `await lcr.remote()` once to synchronise the flag.
+
+Local mode has no acknowledgement to pace commands, so the client waits
+`settle` seconds (0.05 by default) after every local setter and after
+`local()`. The examples also wait for the measurement itself. Set `settle=0` to
+disable the delay; commands sent back-to-back can then be rejected (`cmd err`)
+or missed. Remote mode is paced by the `exec success` reply.
+
+## Timeouts
+
+Every response wait is bounded by the client's `timeout` (2 seconds by default)
+or by an explicit `timeout=` argument. If no response arrives, the method
+raises `TimeoutError`. Before every command the client discards input that is
+already buffered (the equivalent of pyserial's `reset_input_buffer()`), so an
+already-arrived late reply does not shift the next response. A reply that is
+still in flight can still desynchronise the stream; reopen the port if the next
+command fails because of that.
 
 ## Calibration
 
@@ -292,6 +349,13 @@ Verified on a real ET433 with firmware `V2.00.2414.001`:
   **degrees**.
 - **Auto range:** `FUNC:IMP:RANGE:AUTO` does not work; the correct form is
   `FUNC:IMP:RANGE AUTO`.
+- **Local mode pacing:** configuration commands are applied without a reply,
+  and there is no acknowledgement to pace the next command. The client waits
+  `settle` seconds (0.05 by default) after every local setter and after
+  `local()`. Set `settle=0` only if your code paces commands itself; otherwise
+  `FETCH?` sent immediately after `FREQ` can answer `cmd err`, and a setter sent
+  immediately after a query can be missed. Remote mode is paced by the
+  `exec success` reply.
 - **`AUTO` mode** does not report which parameter was actually measured, and
   `fetch()` returns bare numbers. Set the mode explicitly (`C`, `L`, `R`, `Z`)
   if you need units and meaningful labels.
